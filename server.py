@@ -1,42 +1,66 @@
 #!/usr/bin/env python3
 """
-Lightweight REST server for Raspberry Pi CEC + WoL hub.
-No dependencies beyond Python stdlib.
+Raspberry Pi CEC + WoL hub server (Flask, dual-port).
+
+Two Flask apps run in a single process:
+  - Tailscale app (localhost:5050): WoL endpoints, reachable only via tailscale serve
+  - LAN app (0.0.0.0:8080):        TV/CEC endpoints, reachable on the local network
+
+Tailscale setup (one-time):
+  tailscale serve --https=443 http://127.0.0.1:5050
 
 Endpoints:
-  GET  /tv/status    - Returns TV power state
-  POST /tv/on        - Turn TV on via CEC
-  POST /tv/off       - Turn TV off via CEC
-  POST /wol          - Send Wake-on-LAN magic packet to PC
+  Tailscale (via tailscale serve):
+    POST /wol              - Wake a machine by name or MAC
+
+  LAN:
+    GET  /tv/status        - Returns TV power state
+    POST /tv/on            - Turn TV on via CEC
+    POST /tv/off           - Turn TV off via CEC
 
 Usage:
-  python3 pi_server.py
-  python3 pi_server.py --port 8080
-  python3 pi_server.py --host 0.0.0.0 --port 9000
+  python3 server.py
+  python3 server.py --lan-port 8080 --ts-port 5050
+  python3 server.py --config /path/to/wol_targets.json
 """
 
+import argparse
 import json
+import logging
+import os
 import socket
 import struct
 import subprocess
-import sys
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from pathlib import Path
+from threading import Thread
+
+from flask import Flask, jsonify, request
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
-PC_MAC = "AA:BB:CC:DD:EE:FF"  # Replace with your PC's MAC address
+TAILSCALE_HOST = "127.0.0.1"
+TAILSCALE_PORT = 5050
+LAN_HOST = "0.0.0.0"
+LAN_PORT = 8080
+
+WOL_TARGETS_PATH = Path(__file__).parent / "wol_targets.json"
 PC_BROADCAST = "255.255.255.255"  # Or your subnet broadcast, e.g. 192.168.1.255
 WOL_PORT = 9
 
 CEC_DEVICE = "0"  # CEC logical address for TV is typically 0
-DEFAULT_HOST = "0.0.0.0"
-DEFAULT_PORT = 8080
+
+# Module-level state (loaded at startup)
+wol_targets: dict = {}
+
+# Suppress Werkzeug per-request logging
+logging.getLogger("werkzeug").setLevel(logging.WARNING)
 
 # ---------------------------------------------------------------------------
 # CEC helpers
 # ---------------------------------------------------------------------------
+
 
 def cec_send(command: str) -> tuple[bool, str]:
     """Send a command via cec-client. Returns (success, output)."""
@@ -70,7 +94,6 @@ def tv_status() -> tuple[bool, str]:
     ok, output = cec_send(f"pow {CEC_DEVICE}")
     if not ok:
         return False, output
-    # cec-client output contains lines like "power status: on" or "power status: standby"
     for line in output.splitlines():
         lower = line.lower()
         if "power status:" in lower:
@@ -85,13 +108,13 @@ def tv_status() -> tuple[bool, str]:
 # Wake-on-LAN
 # ---------------------------------------------------------------------------
 
-def send_wol(mac: str = PC_MAC) -> tuple[bool, str]:
+
+def send_wol(mac: str) -> tuple[bool, str]:
     """Send a Wake-on-LAN magic packet."""
     try:
         mac_bytes = bytes.fromhex(mac.replace(":", "").replace("-", ""))
         if len(mac_bytes) != 6:
             return False, "invalid MAC address"
-        # Magic packet: 6x 0xFF + 16x MAC
         packet = b"\xff" * 6 + mac_bytes * 16
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -102,73 +125,155 @@ def send_wol(mac: str = PC_MAC) -> tuple[bool, str]:
 
 
 # ---------------------------------------------------------------------------
-# HTTP handler
+# WoL target config
 # ---------------------------------------------------------------------------
 
-ROUTES: dict[tuple[str, str], callable] = {
-    ("GET",  "/tv/status"): tv_status,
-    ("POST", "/tv/on"):     tv_on,
-    ("POST", "/tv/off"):    tv_off,
-    ("POST", "/wol"):       send_wol,
-}
+
+def load_wol_targets(path: Path) -> dict:
+    """Load WoL target map from JSON file. Returns empty dict on failure."""
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        print(f"Warning: WoL targets file not found: {path}")
+        return {}
+    except json.JSONDecodeError as e:
+        print(f"Warning: Invalid JSON in {path}: {e}")
+        return {}
 
 
-class Handler(BaseHTTPRequestHandler):
-    def _handle(self, method: str):
-        handler = ROUTES.get((method, self.path))
-        if handler is None:
-            self._respond(404, {"error": "not found"})
-            return
+# ---------------------------------------------------------------------------
+# Tailscale app (WoL — localhost only, behind tailscale serve)
+# ---------------------------------------------------------------------------
 
-        ok, message = handler()
-        status = 200 if ok else 500
-        self._respond(status, {"ok": ok, "message": message})
+tailscale_app = Flask("tailscale")
 
-    def _respond(self, status: int, body: dict):
-        payload = json.dumps(body).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        self.end_headers()
-        self.wfile.write(payload)
 
-    def do_GET(self):
-        self._handle("GET")
+@tailscale_app.route("/wol", methods=["POST"])
+def wol_handler():
+    # Verify request came through tailscale serve
+    ts_user = request.headers.get("Tailscale-User-Login")
+    if not ts_user:
+        return jsonify(ok=False, error="forbidden: Tailscale identity required"), 403
 
-    def do_POST(self):
-        self._handle("POST")
+    body = request.get_json(silent=True) or {}
 
-    # Suppress default stderr logging per request (optional — remove to debug)
-    def log_message(self, format, *args):
-        pass
+    # Resolve MAC address from target name or direct MAC
+    if "target" in body:
+        target_name = body["target"]
+        target = wol_targets.get(target_name)
+        if target is None:
+            available = ", ".join(wol_targets.keys()) if wol_targets else "(none)"
+            return jsonify(
+                ok=False,
+                error=f"unknown target: '{target_name}'",
+                available=available,
+            ), 400
+        mac = target["mac"]
+    elif "mac" in body:
+        mac = body["mac"]
+    else:
+        return jsonify(ok=False, error="request must include 'target' or 'mac'"), 400
+
+    ok, message = send_wol(mac)
+    status = 200 if ok else 500
+    return jsonify(ok=ok, message=message), status
+
+
+# ---------------------------------------------------------------------------
+# LAN app (TV/CEC — network-accessible)
+# ---------------------------------------------------------------------------
+
+lan_app = Flask("lan")
+
+
+@lan_app.before_request
+def reject_tailscale_traffic():
+    """Guard: reject requests bearing Tailscale identity headers."""
+    if request.headers.get("Tailscale-User-Login"):
+        return jsonify(ok=False, error="forbidden: LAN access only"), 403
+
+
+@lan_app.route("/tv/status", methods=["GET"])
+def tv_status_handler():
+    ok, message = tv_status()
+    status = 200 if ok else 500
+    return jsonify(ok=ok, message=message), status
+
+
+@lan_app.route("/tv/on", methods=["POST"])
+def tv_on_handler():
+    ok, message = tv_on()
+    status = 200 if ok else 500
+    return jsonify(ok=ok, message=message), status
+
+
+@lan_app.route("/tv/off", methods=["POST"])
+def tv_off_handler():
+    ok, message = tv_off()
+    status = 200 if ok else 500
+    return jsonify(ok=ok, message=message), status
 
 
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
-    host = DEFAULT_HOST
-    port = DEFAULT_PORT
+    parser = argparse.ArgumentParser(description="Raspberry Pi CEC + WoL hub")
+    parser.add_argument(
+        "--ts-port",
+        type=int,
+        default=TAILSCALE_PORT,
+        help=f"Tailscale-facing port on localhost (default {TAILSCALE_PORT})",
+    )
+    parser.add_argument(
+        "--lan-port",
+        type=int,
+        default=LAN_PORT,
+        help=f"LAN-facing port (default {LAN_PORT})",
+    )
+    parser.add_argument(
+        "--lan-host",
+        default=LAN_HOST,
+        help=f"LAN bind address (default {LAN_HOST})",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=WOL_TARGETS_PATH,
+        help=f"WoL targets JSON file (default {WOL_TARGETS_PATH})",
+    )
+    args = parser.parse_args()
 
-    args = sys.argv[1:]
-    while args:
-        flag = args.pop(0)
-        if flag == "--host" and args:
-            host = args.pop(0)
-        elif flag == "--port" and args:
-            port = int(args.pop(0))
-        else:
-            print(f"Usage: {sys.argv[0]} [--host HOST] [--port PORT]")
-            sys.exit(1)
+    global wol_targets
+    wol_targets = load_wol_targets(args.config)
 
-    server = HTTPServer((host, port), Handler)
-    print(f"Listening on {host}:{port}")
+    # Suppress Werkzeug reloader banner in threaded mode
+    os.environ["WERKZEUG_RUN_MAIN"] = "true"
+
+    print(f"Tailscale app: {TAILSCALE_HOST}:{args.ts_port}")
+    print(f"LAN app:       {args.lan_host}:{args.lan_port}")
+    if wol_targets:
+        print(f"WoL targets:   {', '.join(wol_targets.keys())}")
+    else:
+        print("WoL targets:   (none loaded)")
+
+    # Start Tailscale app in a background daemon thread
+    ts_thread = Thread(
+        target=lambda: tailscale_app.run(
+            host=TAILSCALE_HOST, port=args.ts_port, use_reloader=False
+        ),
+        daemon=True,
+    )
+    ts_thread.start()
+
+    # Run LAN app on the main thread
     try:
-        server.serve_forever()
+        lan_app.run(host=args.lan_host, port=args.lan_port, use_reloader=False)
     except KeyboardInterrupt:
         print("\nShutting down")
-        server.server_close()
 
 
 if __name__ == "__main__":
