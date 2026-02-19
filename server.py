@@ -27,6 +27,7 @@ Usage:
 import argparse
 import json
 import logging
+import os
 import socket
 import struct
 import subprocess
@@ -53,8 +54,9 @@ CEC_DEVICE = "0"  # CEC logical address for TV is typically 0
 # Module-level state (loaded at startup)
 wol_targets: dict = {}
 
-# Suppress Werkzeug per-request logging
-logging.getLogger("werkzeug").setLevel(logging.WARNING)
+# Set log level via LOG_LEVEL env var (e.g. LOG_LEVEL=DEBUG)
+log_level = os.environ.get("LOG_LEVEL", "WARNING").upper()
+logging.getLogger("werkzeug").setLevel(getattr(logging, log_level, logging.WARNING))
 
 # ---------------------------------------------------------------------------
 # CEC helpers
