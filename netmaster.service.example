@@ -1,5 +1,5 @@
 [Unit]
-Description=netmaster CEC + WoL hub
+Description=netmaster WoL hub
 After=network.target tailscaled.service
 
 [Service]

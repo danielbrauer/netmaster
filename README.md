@@ -1,15 +1,11 @@
 # netmaster
 
-A Raspberry Pi home automation hub that provides Wake-on-LAN and TV control (via HDMI-CEC) as HTTP endpoints. It runs two Flask servers in a single process:
-
-- **Tailscale server** (`127.0.0.1:5050`) — WoL endpoints, accessible only through `tailscale serve`
-- **LAN server** (`0.0.0.0:8080`) — TV/CEC endpoints, accessible on the local network
+A Raspberry Pi Wake-on-LAN hub exposed as an HTTP endpoint via Tailscale. It runs a Flask server on `127.0.0.1:5050`, intended to be exposed via `tailscale serve`.
 
 ## Requirements
 
 - Python 3.6+
 - Flask (`pip install flask`)
-- `cec-client` (for TV control, e.g. `sudo apt install cec-utils`)
 - Tailscale (for remote WoL access)
 
 ## Configuration
@@ -40,14 +36,12 @@ Each key is a friendly name you can use to wake the device. The `mac` field is t
 ### Command-line options
 
 ```
-python3 server.py [--ts-port PORT] [--lan-port PORT] [--lan-host HOST] [--config PATH]
+python3 server.py [--ts-port PORT] [--config PATH]
 ```
 
 | Flag         | Description                        | Default              |
 |--------------|------------------------------------|----------------------|
 | `--ts-port`  | Tailscale-facing port on localhost | `5050`               |
-| `--lan-port` | LAN-facing port                    | `8080`               |
-| `--lan-host` | LAN bind address                   | `0.0.0.0`            |
 | `--config`   | Path to WoL targets JSON file      | `./wol_targets.json` |
 
 ## Endpoints
@@ -82,26 +76,6 @@ Wake a machine by target name or MAC address. Requires the `Tailscale-User-Login
 - `400` — Unknown target name, or missing `target`/`mac` field
 - `403` — Request did not come through Tailscale
 - `500` — Failed to send packet
-
-### LAN — TV Control
-
-These endpoints are served on `0.0.0.0:8080` and control the TV via HDMI-CEC. Requests with Tailscale identity headers are rejected.
-
-#### `GET /tv/status`
-
-Returns the TV power state.
-
-```json
-{ "ok": true, "message": "on" }
-```
-
-#### `POST /tv/on`
-
-Turn the TV on.
-
-#### `POST /tv/off`
-
-Turn the TV off (standby).
 
 ## Tailscale setup
 
