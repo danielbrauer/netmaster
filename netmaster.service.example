@@ -1,0 +1,12 @@
+[Unit]
+Description=netmaster CEC + WoL hub
+After=network.target tailscaled.service
+
+[Service]
+ExecStart=/usr/bin/python3 /home/YOUR_USER/netmaster/server.py
+WorkingDirectory=/home/YOUR_USER/netmaster
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
