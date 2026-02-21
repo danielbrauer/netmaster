@@ -43,7 +43,8 @@ wol_last_wake: dict = {}  # {target_name: UTC ISO timestamp}
 
 # Set log level via LOG_LEVEL env var (e.g. LOG_LEVEL=DEBUG)
 log_level = os.environ.get("LOG_LEVEL", "WARNING").upper()
-logging.getLogger("werkzeug").setLevel(getattr(logging, log_level, logging.WARNING))
+logging.basicConfig(level=getattr(logging, log_level, logging.WARNING))
+log = logging.getLogger("netmaster")
 
 # ---------------------------------------------------------------------------
 # Wake-on-LAN
@@ -74,12 +75,14 @@ def load_wol_targets(path: Path) -> dict:
     """Load WoL target map from JSON file. Returns empty dict on failure."""
     try:
         with open(path) as f:
-            return json.load(f)
+            data = json.load(f)
+        log.debug("Loaded %d WoL target(s) from %s", len(data), path)
+        return data
     except FileNotFoundError:
-        print(f"Warning: WoL targets file not found: {path}")
+        log.warning("WoL targets file not found: %s", path)
         return {}
     except json.JSONDecodeError as e:
-        print(f"Warning: Invalid JSON in {path}: {e}")
+        log.warning("Invalid JSON in %s: %s", path, e)
         return {}
 
 
@@ -115,17 +118,23 @@ def wol_handler():
     else:
         return jsonify(ok=False, error="request must include 'target' or 'mac'"), 400
 
+    log.debug("Sending WoL packet to %s", mac)
     ok, message = send_wol(mac)
     if ok and "target" in body:
         wol_last_wake[target_name] = datetime.now(timezone.utc).isoformat()
+        log.debug("Recorded wake for '%s' at %s", target_name, wol_last_wake[target_name])
+    if not ok:
+        log.error("WoL failed for %s: %s", mac, message)
     status = 200 if ok else 500
     return jsonify(ok=ok, message=message), status
 
 
 @app.route("/wol/last-wake/<name>")
 def wol_last_wake_handler(name):
+    log.debug("Last-wake query for '%s'", name)
     ts = wol_last_wake.get(name)
     if ts is None:
+        log.debug("No WoL record for '%s'", name)
         return jsonify(ok=False, error=f"no WoL record for '{name}'"), 404
     return jsonify(ok=True, target=name, last_wake=ts), 200
 
@@ -154,16 +163,16 @@ def main():
     global wol_targets
     wol_targets = load_wol_targets(args.config)
 
-    print(f"Listening: {HOST}:{args.ts_port}")
+    log.info("Listening on %s:%d", HOST, args.ts_port)
     if wol_targets:
-        print(f"WoL targets: {', '.join(wol_targets.keys())}")
+        log.info("WoL targets: %s", ", ".join(wol_targets.keys()))
     else:
-        print("WoL targets: (none loaded)")
+        log.info("WoL targets: (none loaded)")
 
     try:
         app.run(host=HOST, port=args.ts_port, use_reloader=False)
     except KeyboardInterrupt:
-        print("\nShutting down")
+        log.info("Shutting down")
 
 
 if __name__ == "__main__":
