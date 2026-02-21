@@ -1,12 +1,11 @@
 # netmaster
 
-A Raspberry Pi Wake-on-LAN hub exposed as an HTTP endpoint via Tailscale. It runs a Flask server on `127.0.0.1:5050`, intended to be exposed via `tailscale serve`.
+A Raspberry Pi Wake-on-LAN hub exposed as an HTTP endpoint. It runs a Flask server on `0.0.0.0:5050`, accessible from the LAN or via Tailscale.
 
 ## Requirements
 
 - Python 3.6+
 - Flask (`pip install flask`)
-- Tailscale (for remote WoL access)
 
 ## Configuration
 
@@ -41,22 +40,18 @@ python3 server.py [--ts-port PORT] [--config PATH]
 
 | Flag         | Description                        | Default              |
 |--------------|------------------------------------|----------------------|
-| `--ts-port`  | Tailscale-facing port on localhost | `5050`               |
+| `--ts-port`  | Port to listen on                  | `5050`               |
 | `--config`   | Path to WoL targets JSON file      | `./wol_targets.json` |
 
 ## Endpoints
 
-### Tailscale — Wake-on-LAN
-
-These endpoints are served on `127.0.0.1:5050` and are intended to be exposed via `tailscale serve`.
-
-#### `GET /wol`
+### `GET /wol`
 
 Health check. Returns `{"ok": true}`.
 
-#### `POST /wol`
+### `POST /wol`
 
-Wake a machine by target name or MAC address. Requires the `Tailscale-User-Login` header (set automatically by `tailscale serve`).
+Wake a machine by target name or MAC address.
 
 **Wake by name** (must match a key in `wol_targets.json`):
 
@@ -74,16 +69,22 @@ Wake a machine by target name or MAC address. Requires the `Tailscale-User-Login
 
 - `200` — WoL packet sent successfully
 - `400` — Unknown target name, or missing `target`/`mac` field
-- `403` — Request did not come through Tailscale
 - `500` — Failed to send packet
 
-## Tailscale setup
+### `GET /wol/last-wake/<name>`
 
-Expose the WoL endpoint over your tailnet (one-time):
+Check when a machine was last woken via WoL. The `name` must match a target name used in a previous `POST /wol` request.
 
 ```
-tailscale serve --https=443 http://127.0.0.1:5050
+GET /wol/last-wake/desktop
 ```
+
+**Responses:**
+
+- `200` — `{"ok": true, "target": "desktop", "last_wake": "2026-02-21T15:30:00.123456+00:00"}`
+- `404` — No WoL record for that name
+
+Note: wake history is in-memory and resets when the server restarts.
 
 ## Running as a systemd service
 

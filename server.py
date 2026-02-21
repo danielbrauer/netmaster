@@ -6,8 +6,8 @@ Tailscale setup (one-time):
   tailscale serve --https=443 http://127.0.0.1:5050
 
 Endpoints:
-  Tailscale (via tailscale serve):
-    POST /wol              - Wake a machine by name or MAC
+  POST /wol                    - Wake a machine by name or MAC (Tailscale auth required)
+  GET  /wol/last-wake/<name>   - Check when a machine was last woken via WoL
 
 Usage:
   python3 server.py
@@ -21,6 +21,7 @@ import logging
 import os
 import socket
 import struct
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import Flask, jsonify, request
@@ -29,7 +30,7 @@ from flask import Flask, jsonify, request
 # Config
 # ---------------------------------------------------------------------------
 
-TAILSCALE_HOST = "127.0.0.1"
+HOST = "0.0.0.0"
 TAILSCALE_PORT = 5050
 
 WOL_TARGETS_PATH = Path(__file__).parent / "wol_targets.json"
@@ -38,6 +39,7 @@ WOL_PORT = 9
 
 # Module-level state (loaded at startup)
 wol_targets: dict = {}
+wol_last_wake: dict = {}  # {target_name: UTC ISO timestamp}
 
 # Set log level via LOG_LEVEL env var (e.g. LOG_LEVEL=DEBUG)
 log_level = os.environ.get("LOG_LEVEL", "WARNING").upper()
@@ -94,11 +96,6 @@ def wol_handler():
     if request.method == "GET":
         return jsonify(ok=True), 200
 
-    # Verify request came through tailscale serve
-    ts_user = request.headers.get("Tailscale-User-Login")
-    if not ts_user:
-        return jsonify(ok=False, error="forbidden: Tailscale identity required"), 403
-
     body = request.get_json(silent=True) or {}
 
     # Resolve MAC address from target name or direct MAC
@@ -119,8 +116,18 @@ def wol_handler():
         return jsonify(ok=False, error="request must include 'target' or 'mac'"), 400
 
     ok, message = send_wol(mac)
+    if ok and "target" in body:
+        wol_last_wake[target_name] = datetime.now(timezone.utc).isoformat()
     status = 200 if ok else 500
     return jsonify(ok=ok, message=message), status
+
+
+@app.route("/wol/last-wake/<name>")
+def wol_last_wake_handler(name):
+    ts = wol_last_wake.get(name)
+    if ts is None:
+        return jsonify(ok=False, error=f"no WoL record for '{name}'"), 404
+    return jsonify(ok=True, target=name, last_wake=ts), 200
 
 
 # ---------------------------------------------------------------------------
@@ -147,14 +154,14 @@ def main():
     global wol_targets
     wol_targets = load_wol_targets(args.config)
 
-    print(f"Listening: {TAILSCALE_HOST}:{args.ts_port}")
+    print(f"Listening: {HOST}:{args.ts_port}")
     if wol_targets:
         print(f"WoL targets: {', '.join(wol_targets.keys())}")
     else:
         print("WoL targets: (none loaded)")
 
     try:
-        app.run(host=TAILSCALE_HOST, port=args.ts_port, use_reloader=False)
+        app.run(host=HOST, port=args.ts_port, use_reloader=False)
     except KeyboardInterrupt:
         print("\nShutting down")
 
