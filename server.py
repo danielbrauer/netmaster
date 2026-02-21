@@ -135,7 +135,6 @@ def wol_last_wake_handler(name):
     ts = wol_last_wake.get(name)
     if ts is None:
         log.debug("No WoL record for '%s'", name)
-        return jsonify(ok=False, error=f"no WoL record for '{name}'"), 404
     return jsonify(ok=True, target=name, last_wake=ts), 200
 
 
